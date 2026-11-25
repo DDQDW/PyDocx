@@ -257,13 +257,32 @@ export default function App() {
         throw new Error(data.error || 'Не удалось сверстать документ.');
       }
 
-      const summary = data.parsed
-        ? `Заголовок: "${data.parsed.title || '—'}", пунктов списка: ${data.parsed.listCount}, строк таблицы: ${data.parsed.tableRows}`
-        : '';
-      setLayoutLog(`${data.message}\n${summary}\n`);
-      const fileItem = { filename: data.filename, downloadUrl: data.downloadUrl };
-      setLayoutDownloads([fileItem]);
-      showSnackbar(`Готово: ${data.filename}`, data.downloadUrl, data.filename);
+      if (data.executedAsScript) {
+        const logsText = Array.isArray(data.logs) && data.logs.length > 0
+          ? data.logs.join('\n')
+          : data.message || 'Скрипт выполнен.';
+        setLayoutLog(`${logsText}\n`);
+        const files: GeneratedFileLink[] =
+          Array.isArray(data.createdFiles) && data.createdFiles.length > 0
+            ? data.createdFiles
+            : data.filename && data.downloadUrl
+              ? [{ filename: data.filename, downloadUrl: data.downloadUrl }]
+              : [];
+        setLayoutDownloads(files);
+        if (files.length > 0) {
+          showSnackbar(`Готово: ${files[0].filename}`, files[0].downloadUrl, files[0].filename);
+        } else {
+          showSnackbar(data.message || 'Скрипт выполнен');
+        }
+      } else {
+        const summary = data.parsed
+          ? `Заголовок: "${data.parsed.title || '—'}", пунктов списка: ${data.parsed.listCount}, строк таблицы: ${data.parsed.tableRows}`
+          : '';
+        setLayoutLog(`${data.message}\n${summary}\n`);
+        const fileItem = { filename: data.filename, downloadUrl: data.downloadUrl };
+        setLayoutDownloads([fileItem]);
+        showSnackbar(`Готово: ${data.filename}`, data.downloadUrl, data.filename);
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       setLayoutLog((prev) => `${prev}❌ Ошибка: ${message}\n`);

@@ -4,6 +4,7 @@ import io
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 import threading
@@ -554,6 +555,48 @@ def _snapshot_dir(target_dir):
     return snap
 
 
+def _dir_is_writable(path_dir):
+    try:
+        ensure_dir(path_dir)
+        probe = os.path.join(path_dir, ".pydocx_write_test")
+        with open(probe, "wb") as f:
+            f.write(b"1")
+        os.remove(probe)
+        return True
+    except Exception:
+        return False
+
+
+def _looks_like_executable_script(raw_text, source_name=""):
+    code = str(raw_text or "").strip()
+    if not code:
+        return False
+    lower_name = str(source_name or "").lower()
+    script_markers = (
+        "from docx import",
+        "import docx",
+        "from pptx import",
+        "import openpyxl",
+        "from fpdf import",
+        "create_docx(",
+        "create_pptx(",
+        "create_xlsx(",
+        "create_pdf(",
+        "create_from_text(",
+        "doc.save(",
+        'if __name__ == "__main__":',
+        "if __name__ == '__main__':",
+    )
+    if lower_name.endswith(".py") or any(m in code for m in script_markers):
+        try:
+            compile(code, "<check>", "exec")
+            return True
+        except SyntaxError:
+            extracted = _extract_python_blocks_from_markdown(code)
+            return bool(extracted)
+    return False
+
+
 def execute_user_script(
     code,
     log_output,
@@ -566,17 +609,22 @@ def execute_user_script(
         old_cwd = os.getcwd()
         _pop_recent_created_files()
 
-        # If target_dir is writable, switch cwd temporarily so relative doc.save("name.docx") lands there directly
         target_dir_norm = os.path.normpath(target_dir)
+        staging_dir = None
+        if _dir_is_writable(target_dir_norm):
+            work_dir = target_dir_norm
+        else:
+            staging_dir = tempfile.mkdtemp(prefix="pydocx_run_")
+            work_dir = staging_dir
+
         switched_cwd = False
         try:
-            ensure_dir(target_dir_norm)
-            os.chdir(target_dir_norm)
+            os.chdir(work_dir)
             switched_cwd = True
         except Exception:
             switched_cwd = False
 
-        watch_dirs = list(dict.fromkeys([os.getcwd(), old_cwd, APP_DIR, target_dir_norm]))
+        watch_dirs = list(dict.fromkeys([work_dir, os.getcwd(), old_cwd, APP_DIR, target_dir_norm]))
         before = {}
         for d in watch_dirs:
             before.update(_snapshot_dir(d))
@@ -592,6 +640,9 @@ def execute_user_script(
                     code_to_run = extracted
 
             namespace = {
+                "__name__": "__main__",
+                "__file__": source_path or os.path.join(work_dir, "script.py"),
+                "__builtins__": __builtins__,
                 "create_docx": lambda t, txt, lst, tbl, fn: create_docx(t, txt, lst, tbl, fn, target_dir=target_dir_norm),
                 "create_pptx": lambda t, txt, lst, fn: create_pptx(t, txt, lst, fn, target_dir=target_dir_norm),
                 "create_xlsx": lambda tbl, fn: create_xlsx(tbl, fn, target_dir=target_dir_norm),
@@ -612,7 +663,7 @@ def execute_user_script(
                 "json": json,
                 "csv": csv,
                 "re": re,
-                "print": lambda *args: log_output(f"[PRINT] {' '.join(map(str, args))}"),
+                "print": lambda *args, **kwargs: log_output(f"[PRINT] {' '.join(map(str, args))}"),
             }
             sys.stdout = io.StringIO()
             exec(code_to_run, namespace)
@@ -628,7 +679,7 @@ def execute_user_script(
                     if full_path not in before or before[full_path] != stat_val:
                         fname = os.path.basename(full_path)
                         if fname.lower().endswith(GENERATED_EXTENSIONS) and fname not in recorded_names:
-                            if os.path.normpath(d) == target_dir_norm:
+                            if os.path.normpath(d) == target_dir_norm and staging_dir is None:
                                 with open(full_path, "rb") as fp:
                                     data = fp.read()
                                 recorded.append(
@@ -671,6 +722,8 @@ def execute_user_script(
                     os.chdir(old_cwd)
                 except Exception:
                     pass
+            if staging_dir:
+                shutil.rmtree(staging_dir, ignore_errors=True)
 
     threading.Thread(target=run, daemon=True).start()
 
@@ -1068,6 +1121,23 @@ def main(page: ft.Page):
                 raw = layout_content_field.value
                 if not raw or not raw.strip():
                     raise ValueError("Текстовый файл пуст.")
+                if _looks_like_executable_script(raw, layout_source["name"]):
+                    target_dir, _ = get_effective_target_dir(layout_source)
+                    layout_log.value = (
+                        f"ℹ️ Обнаружен исполняемый Python-скрипт — выполняю генерацию документа...\n"
+                        f"(целевая папка: {target_dir})\n"
+                    )
+                    layout_save_buttons.controls = []
+                    page.update()
+                    execute_user_script(
+                        raw,
+                        log_layout,
+                        target_dir=target_dir,
+                        source_path=layout_source["path"],
+                        on_files_ready=lambda items: populate_save_buttons(layout_save_buttons, items),
+                    )
+                    return
+
                 base = os.path.splitext(layout_filename_field.value.strip() or "layout")[0]
                 t, txt, lst, tbl = parse_layout_from_text(raw, layout_source["name"])
                 target_dir, _ = get_effective_target_dir(layout_source)

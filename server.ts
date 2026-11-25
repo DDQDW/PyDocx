@@ -1,17 +1,23 @@
 import express from 'express';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import vm from 'node:vm';
+import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
+  AlignmentType,
   Document,
   Packer,
+  PageBreak,
   Paragraph,
   HeadingLevel,
   Table,
   TableRow,
   TableCell,
+  TextRun,
+  UnderlineType,
   WidthType,
 } from 'docx';
 import PptxGenJS from 'pptxgenjs';
@@ -22,6 +28,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const ASSETS_DIR = path.join(__dirname, 'assets');
 const FONT_PATH = path.join(ASSETS_DIR, 'DejaVuSans.ttf');
+const PY_RUNNER_PATH = path.join(__dirname, 'server', 'py_runner.py');
 
 interface StoredFile {
   id: string;
@@ -792,6 +799,599 @@ function preprocessScript(code: string): string {
   return transformedLines.join('\n');
 }
 
+interface DocxIrRun {
+  text?: string;
+  bold?: boolean | null;
+  italic?: boolean | null;
+  underline?: boolean;
+  fontName?: string | null;
+  fontSizePt?: number | null;
+  colorHex?: string | null;
+}
+
+interface DocxIrBlock {
+  type: 'paragraph' | 'table' | 'page_break';
+  headingLevel?: number | null;
+  alignment?: string | null;
+  spaceBeforeTwips?: number | null;
+  spaceAfterTwips?: number | null;
+  firstLineIndentTwips?: number | null;
+  leftIndentTwips?: number | null;
+  rightIndentTwips?: number | null;
+  lineSpacing?: number | null;
+  lineSpacingPt?: number | null;
+  pageBreakBefore?: boolean;
+  runs?: DocxIrRun[];
+  rows?: string[][];
+}
+
+interface DocxIrSpec {
+  defaultFont?: string;
+  defaultSizePt?: number;
+  section?: {
+    pageWidthTwips?: number | null;
+    pageHeightTwips?: number | null;
+    topMarginTwips?: number | null;
+    bottomMarginTwips?: number | null;
+    leftMarginTwips?: number | null;
+    rightMarginTwips?: number | null;
+  };
+  blocks: DocxIrBlock[];
+}
+
+function mapDocxAlignment(
+  val?: string | null
+): (typeof AlignmentType)[keyof typeof AlignmentType] | undefined {
+  if (!val) return undefined;
+  const upper = val.toUpperCase();
+  if (upper === 'CENTER') return AlignmentType.CENTER;
+  if (upper === 'RIGHT' || upper === 'END') return AlignmentType.END;
+  if (upper === 'LEFT' || upper === 'START') return AlignmentType.START;
+  if (upper === 'JUSTIFY' || upper === 'BOTH' || upper === 'DISTRIBUTE') return AlignmentType.BOTH;
+  return undefined;
+}
+
+function mapHeadingLevel(
+  level?: number | null
+): (typeof HeadingLevel)[keyof typeof HeadingLevel] | undefined {
+  if (level === 1) return HeadingLevel.HEADING_1;
+  if (level === 2) return HeadingLevel.HEADING_2;
+  if (level === 3) return HeadingLevel.HEADING_3;
+  if (level === 4) return HeadingLevel.HEADING_4;
+  return undefined;
+}
+
+async function renderDocxFromIr(
+  spec: DocxIrSpec,
+  filename: string
+): Promise<{ message: string; stored: StoredFile }> {
+  const defaultFont = spec.defaultFont || 'Times New Roman';
+  const defaultSizePt = spec.defaultSizePt || 12;
+  const children: Array<Paragraph | Table> = [];
+
+  for (const block of spec.blocks || []) {
+    if (block.type === 'page_break') {
+      children.push(new Paragraph({ children: [new PageBreak()] }));
+      continue;
+    }
+
+    if (block.type === 'table') {
+      const tableRows = block.rows || [];
+      if (tableRows.length > 0) {
+        const cols = Math.max(...tableRows.map((r) => r.length), 1);
+        children.push(
+          new Table({
+            width: { size: 100, type: WidthType.PERCENTAGE },
+            rows: tableRows.map(
+              (row) =>
+                new TableRow({
+                  children: Array.from({ length: cols }, (_, j) => {
+                    return new TableCell({
+                      children: [
+                        new Paragraph({
+                          children: [
+                            new TextRun({
+                              text: String(row[j] ?? ''),
+                              font: defaultFont,
+                              size: Math.round(defaultSizePt * 2),
+                            }),
+                          ],
+                        }),
+                      ],
+                    });
+                  }),
+                })
+            ),
+          })
+        );
+      }
+      continue;
+    }
+
+    const runs: Array<TextRun> = [];
+    for (const r of block.runs || []) {
+      const text = String(r.text ?? '');
+      const parts = text.split('\n');
+      parts.forEach((part, idx) => {
+        const fontSizePt = r.fontSizePt ?? defaultSizePt;
+        runs.push(
+          new TextRun({
+            text: part,
+            break: idx > 0 ? 1 : undefined,
+            bold: r.bold ?? undefined,
+            italics: r.italic ?? undefined,
+            underline: r.underline ? { type: UnderlineType.SINGLE } : undefined,
+            font: r.fontName || defaultFont,
+            size: Math.round(fontSizePt * 2),
+            color: r.colorHex || undefined,
+          })
+        );
+      });
+    }
+
+    if (runs.length === 0) {
+      runs.push(
+        new TextRun({
+          text: '',
+          font: defaultFont,
+          size: Math.round(defaultSizePt * 2),
+        })
+      );
+    }
+
+    const spacing: { before?: number; after?: number; line?: number } = {};
+    if (typeof block.spaceBeforeTwips === 'number') spacing.before = block.spaceBeforeTwips;
+    if (typeof block.spaceAfterTwips === 'number') spacing.after = block.spaceAfterTwips;
+    if (typeof block.lineSpacing === 'number') {
+      spacing.line = Math.round(block.lineSpacing * 240);
+    } else if (typeof block.lineSpacingPt === 'number') {
+      spacing.line = Math.round(block.lineSpacingPt * 20);
+    }
+
+    const indent: { firstLine?: number; left?: number; right?: number } = {};
+    if (typeof block.firstLineIndentTwips === 'number') indent.firstLine = block.firstLineIndentTwips;
+    if (typeof block.leftIndentTwips === 'number') indent.left = block.leftIndentTwips;
+    if (typeof block.rightIndentTwips === 'number') indent.right = block.rightIndentTwips;
+
+    children.push(
+      new Paragraph({
+        children: runs,
+        heading: mapHeadingLevel(block.headingLevel),
+        alignment: mapDocxAlignment(block.alignment),
+        pageBreakBefore: block.pageBreakBefore || undefined,
+        spacing: Object.keys(spacing).length > 0 ? spacing : undefined,
+        indent: Object.keys(indent).length > 0 ? indent : undefined,
+      })
+    );
+  }
+
+  if (children.length === 0) {
+    children.push(new Paragraph({ text: '' }));
+  }
+
+  const sec = spec.section || {};
+  const doc = new Document({
+    styles: {
+      default: {
+        document: {
+          run: {
+            font: defaultFont,
+            size: Math.round(defaultSizePt * 2),
+          },
+        },
+      },
+    },
+    sections: [
+      {
+        properties: {
+          page: {
+            size: {
+              width: sec.pageWidthTwips ?? 11906,
+              height: sec.pageHeightTwips ?? 16838,
+            },
+            margin: {
+              top: sec.topMarginTwips ?? 1134,
+              bottom: sec.bottomMarginTwips ?? 1134,
+              left: sec.leftMarginTwips ?? 1417,
+              right: sec.rightMarginTwips ?? 850,
+            },
+          },
+        },
+        children,
+      },
+    ],
+  });
+
+  const buffer = await Packer.toBuffer(doc);
+  const stored = storeGeneratedFile(
+    filename,
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    buffer
+  );
+  return { message: `Файл ${stored.filename} сохранен в Downloads`, stored };
+}
+
+async function renderPptxFromIr(
+  slides: Array<{ title: string; bodyLines: string[] }>,
+  filename: string
+): Promise<{ message: string; stored: StoredFile }> {
+  const PptxCtor =
+    (PptxGenJS as unknown as { default?: typeof PptxGenJS }).default ?? PptxGenJS;
+  const prs = new PptxCtor();
+  for (const s of slides.length > 0 ? slides : [{ title: '', bodyLines: [] }]) {
+    const slide = prs.addSlide();
+    slide.addText(String(s.title || ''), {
+      x: 0.6,
+      y: 0.4,
+      w: 8.8,
+      h: 0.9,
+      fontSize: 26,
+      bold: true,
+      color: '1F2937',
+    });
+    if (s.bodyLines.length > 0) {
+      slide.addText(
+        s.bodyLines.map((line, i) => ({
+          text: line,
+          options: i === 0 ? { breakLine: true, fontSize: 16 } : { bullet: true, fontSize: 15 },
+        })),
+        { x: 0.6, y: 1.5, w: 8.8, h: 4.5, valign: 'top' }
+      );
+    }
+  }
+  const output = await prs.write({ outputType: 'nodebuffer' });
+  const buffer = Buffer.isBuffer(output) ? output : Buffer.from(output as ArrayBuffer);
+  const stored = storeGeneratedFile(
+    filename,
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    buffer
+  );
+  return { message: `Файл ${stored.filename} сохранен в Downloads`, stored };
+}
+
+async function renderXlsxFromIr(
+  rows: string[][],
+  filename: string
+): Promise<{ message: string; stored: StoredFile }> {
+  const csvStr = rows.map((r) => r.map(escapeCsvCell).join(',')).join('\n');
+  return createXlsx(csvStr || ' ', filename);
+}
+
+function looksLikeExecutableScript(rawText: string, sourceFilename = ''): boolean {
+  const code = String(rawText || '').trim();
+  if (!code) return false;
+  const lower = String(sourceFilename || '').toLowerCase();
+  if (lower.endsWith('.py')) return true;
+  const markers = [
+    'from docx import',
+    'import docx',
+    'from pptx import',
+    'import openpyxl',
+    'from fpdf import',
+    'create_docx(',
+    'create_pptx(',
+    'create_xlsx(',
+    'create_pdf(',
+    'create_from_text(',
+    'doc.save(',
+    'if __name__ == "__main__":',
+    "if __name__ == '__main__':",
+  ];
+  return markers.some((m) => code.includes(m));
+}
+
+function runPythonRunner(
+  code: string,
+  workDir: string
+): Promise<{
+  ok: boolean;
+  syntaxError?: boolean;
+  error?: string;
+  logs: string[];
+  artifacts: Array<Record<string, unknown>>;
+}> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('python3', ['-B', PY_RUNNER_PATH], {
+      cwd: __dirname,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error('Превышено время выполнения скрипта (10 сек).'));
+    }, 10000);
+
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk.toString('utf-8');
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString('utf-8');
+    });
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on('close', (exitCode) => {
+      clearTimeout(timer);
+      if (!stdout.trim()) {
+        reject(new Error(stderr.trim() || `Python завершился с кодом ${exitCode}`));
+        return;
+      }
+      try {
+        resolve(JSON.parse(stdout));
+      } catch {
+        reject(new Error(`Некорректный вывод Python-раннера: ${stdout.slice(0, 300)}`));
+      }
+    });
+    child.stdin.write(JSON.stringify({ code, workDir }));
+    child.stdin.end();
+  });
+}
+
+async function runJsVmFallback(code: string) {
+  const logs: string[] = [];
+  const createdFiles: Array<{ filename: string; downloadUrl: string; message: string }> = [];
+  const appendLog = (msg: string) => logs.push(msg);
+
+  const context = vm.createContext({
+    create_docx: async (
+      title: string,
+      text: string,
+      list_items: string,
+      table_csv: string,
+      filename: string
+    ) => {
+      const r = await createDocx(title, text, list_items, table_csv, filename);
+      createdFiles.push({
+        filename: r.stored.filename,
+        downloadUrl: `/api/download/${r.stored.id}`,
+        message: r.message,
+      });
+      return r.message;
+    },
+    create_pptx: async (title: string, text: string, list_items: string, filename: string) => {
+      const r = await createPptx(title, text, list_items, filename);
+      createdFiles.push({
+        filename: r.stored.filename,
+        downloadUrl: `/api/download/${r.stored.id}`,
+        message: r.message,
+      });
+      return r.message;
+    },
+    create_xlsx: async (table_csv: string, filename: string) => {
+      const r = await createXlsx(table_csv, filename);
+      createdFiles.push({
+        filename: r.stored.filename,
+        downloadUrl: `/api/download/${r.stored.id}`,
+        message: r.message,
+      });
+      return r.message;
+    },
+    create_pdf: async (title: string, text: string, list_items: string, filename: string) => {
+      const r = await createPdf(title, text, list_items, filename);
+      createdFiles.push({
+        filename: r.stored.filename,
+        downloadUrl: `/api/download/${r.stored.id}`,
+        message: r.message,
+      });
+      return r.message;
+    },
+    create_txt: async (
+      title: string,
+      text: string,
+      list_items: string,
+      table_csv: string,
+      filename: string
+    ) => {
+      const r = await createTxt(title, text, list_items, table_csv, filename);
+      createdFiles.push({
+        filename: r.stored.filename,
+        downloadUrl: `/api/download/${r.stored.id}`,
+        message: r.message,
+      });
+      return r.message;
+    },
+    create_md: async (
+      title: string,
+      text: string,
+      list_items: string,
+      table_csv: string,
+      filename: string
+    ) => {
+      const r = await createMd(title, text, list_items, table_csv, filename);
+      createdFiles.push({
+        filename: r.stored.filename,
+        downloadUrl: `/api/download/${r.stored.id}`,
+        message: r.message,
+      });
+      return r.message;
+    },
+    create_html: async (
+      title: string,
+      text: string,
+      list_items: string,
+      table_csv: string,
+      filename: string
+    ) => {
+      const r = await createHtml(title, text, list_items, table_csv, filename);
+      createdFiles.push({
+        filename: r.stored.filename,
+        downloadUrl: `/api/download/${r.stored.id}`,
+        message: r.message,
+      });
+      return r.message;
+    },
+    create_from_text: async (
+      raw_text: string,
+      format: string = 'docx',
+      filename: string = 'document'
+    ) => {
+      const layout = parseLayoutFromText(String(raw_text ?? ''));
+      const r = await generateByFormat(format, layout, filename);
+      createdFiles.push({
+        filename: r.stored.filename,
+        downloadUrl: `/api/download/${r.stored.id}`,
+        message: r.message,
+      });
+      return r.message;
+    },
+    parse_layout: (raw_text: string) => parseLayoutFromText(String(raw_text ?? '')),
+    save_file_to_download: async (filename: string, content: string | Buffer | Uint8Array) => {
+      const buf = Buffer.isBuffer(content)
+        ? content
+        : content instanceof Uint8Array
+        ? Buffer.from(content)
+        : Buffer.from(String(content), 'utf-8');
+      const stored = storeGeneratedFile(filename, 'application/octet-stream', buf);
+      const msg = `Файл ${stored.filename} сохранен в Downloads`;
+      createdFiles.push({
+        filename: stored.filename,
+        downloadUrl: `/api/download/${stored.id}`,
+        message: msg,
+      });
+      return `/Downloads/${stored.filename}`;
+    },
+    print: (...args: unknown[]) => appendLog(`[PRINT] ${args.map((a) => String(a)).join(' ')}`),
+  });
+
+  const transformed = preprocessScript(code);
+  const wrapped = `(async () => {\n${transformed}\n})()`;
+  const execution = vm.runInContext(wrapped, context, { timeout: 5000 });
+  await execution;
+
+  for (const file of createdFiles) {
+    appendLog(file.message);
+  }
+  appendLog('✅ Скрипт выполнен успешно.');
+  return { ok: true, logs, createdFiles };
+}
+
+async function executeScriptUnified(code: string): Promise<{
+  ok: boolean;
+  logs: string[];
+  createdFiles: Array<{ filename: string; downloadUrl: string; message: string }>;
+}> {
+  const logs: string[] = [];
+  const createdFiles: Array<{ filename: string; downloadUrl: string; message: string }> = [];
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pydocx_web_'));
+
+  try {
+    if (fs.existsSync(PY_RUNNER_PATH)) {
+      const pyRes = await runPythonRunner(code, workDir);
+      if (pyRes.syntaxError) {
+        // Fallback to JS VM only when input looks like JS instead of broken Python
+        const looksLikeJs =
+          /(?:^|\n)\s*(?:const|let|var|function|async\s+function)\b|\/\/|;\s*$/m.test(code);
+        if (looksLikeJs) {
+          return await runJsVmFallback(code);
+        }
+        logs.push(...(pyRes.logs || []));
+        logs.push(`❌ ${pyRes.error || 'Синтаксическая ошибка в скрипте.'}`);
+        return { ok: false, logs, createdFiles };
+      }
+
+      logs.push(...(pyRes.logs || []));
+      for (const art of pyRes.artifacts || []) {
+        const kind = String(art.kind || '');
+        if (kind === 'docx_ir') {
+          const r = await renderDocxFromIr(
+            art.spec as DocxIrSpec,
+            String(art.filename || 'document.docx')
+          );
+          createdFiles.push({
+            filename: r.stored.filename,
+            downloadUrl: `/api/download/${r.stored.id}`,
+            message: r.message,
+          });
+        } else if (kind === 'pptx_ir') {
+          const r = await renderPptxFromIr(
+            (art.slides as Array<{ title: string; bodyLines: string[] }>) || [],
+            String(art.filename || 'presentation.pptx')
+          );
+          createdFiles.push({
+            filename: r.stored.filename,
+            downloadUrl: `/api/download/${r.stored.id}`,
+            message: r.message,
+          });
+        } else if (kind === 'xlsx_ir') {
+          const r = await renderXlsxFromIr(
+            (art.rows as string[][]) || [],
+            String(art.filename || 'table.xlsx')
+          );
+          createdFiles.push({
+            filename: r.stored.filename,
+            downloadUrl: `/api/download/${r.stored.id}`,
+            message: r.message,
+          });
+        } else if (kind === 'pdf_ir') {
+          const lines = (art.lines as string[]) || [];
+          const r = await createPdf(
+            lines[0] || '',
+            lines.slice(1).join('\n'),
+            '',
+            String(art.filename || 'document.pdf')
+          );
+          createdFiles.push({
+            filename: r.stored.filename,
+            downloadUrl: `/api/download/${r.stored.id}`,
+            message: r.message,
+          });
+        } else if (kind === 'helper') {
+          const r = await generateByFormat(
+            String(art.format || 'docx'),
+            {
+              title: String(art.title || ''),
+              text: String(art.text || ''),
+              listItems: String(art.listItems || ''),
+              tableCsv: String(art.tableCsv || ''),
+            },
+            String(art.filename || 'document.docx')
+          );
+          createdFiles.push({
+            filename: r.stored.filename,
+            downloadUrl: `/api/download/${r.stored.id}`,
+            message: r.message,
+          });
+        }
+      }
+
+      // Collect any direct files written inside workDir (e.g. via open() or save_file())
+      const recordedNames = new Set(createdFiles.map((f) => f.filename));
+      for (const name of fs.readdirSync(workDir)) {
+        const full = path.join(workDir, name);
+        if (fs.statSync(full).isFile() && !recordedNames.has(name)) {
+          const buf = fs.readFileSync(full);
+          const stored = storeGeneratedFile(name, 'application/octet-stream', buf);
+          const msg = `Файл ${stored.filename} сохранен в Downloads`;
+          createdFiles.push({
+            filename: stored.filename,
+            downloadUrl: `/api/download/${stored.id}`,
+            message: msg,
+          });
+          recordedNames.add(stored.filename);
+        }
+      }
+
+      for (const file of createdFiles) {
+        logs.push(file.message);
+      }
+      if (pyRes.ok) {
+        logs.push('✅ Скрипт выполнен успешно.');
+      }
+      return { ok: Boolean(pyRes.ok), logs, createdFiles };
+    }
+
+    return await runJsVmFallback(code);
+  } catch (err) {
+    const errorText = err instanceof Error ? `${err.message}\n${err.stack ?? ''}` : String(err);
+    logs.push(`❌ Ошибка: ${errorText}`);
+    return { ok: false, logs, createdFiles };
+  } finally {
+    fs.rmSync(workDir, { recursive: true, force: true });
+  }
+}
+
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '5mb' }));
@@ -836,6 +1436,31 @@ async function startServer() {
         return;
       }
 
+      if (looksLikeExecutableScript(rawText, String(sourceFilename || ''))) {
+        const scriptRes = await executeScriptUnified(rawText);
+        if (!scriptRes.ok) {
+          res.status(400).json({
+            ok: false,
+            error: scriptRes.logs.join('\n') || 'Ошибка выполнения скрипта.',
+          });
+          return;
+        }
+        const firstFile = scriptRes.createdFiles[0];
+        res.json({
+          ok: true,
+          executedAsScript: true,
+          logs: [
+            'ℹ️ Обнаружен исполняемый Python-скрипт — выполнена генерация документа.',
+            ...scriptRes.logs,
+          ],
+          message: firstFile?.message || 'Скрипт выполнен.',
+          filename: firstFile?.filename,
+          downloadUrl: firstFile?.downloadUrl,
+          createdFiles: scriptRes.createdFiles,
+        });
+        return;
+      }
+
       const parsed = parseLayoutFromText(rawText, String(sourceFilename || ''));
       const baseFromSource = sourceFilename
         ? path.basename(String(sourceFilename), path.extname(String(sourceFilename)))
@@ -862,168 +1487,8 @@ async function startServer() {
 
   app.post('/api/run-script', async (req, res) => {
     const code = String(req.body?.code ?? '');
-    const logs: string[] = [];
-    const createdFiles: Array<{ filename: string; downloadUrl: string; message: string }> = [];
-
-    const appendLog = (msg: string) => {
-      logs.push(msg);
-    };
-
-    try {
-      const context = vm.createContext({
-        create_docx: async (
-          title: string,
-          text: string,
-          list_items: string,
-          table_csv: string,
-          filename: string
-        ) => {
-          const r = await createDocx(title, text, list_items, table_csv, filename);
-          createdFiles.push({
-            filename: r.stored.filename,
-            downloadUrl: `/api/download/${r.stored.id}`,
-            message: r.message,
-          });
-          return r.message;
-        },
-        create_pptx: async (
-          title: string,
-          text: string,
-          list_items: string,
-          filename: string
-        ) => {
-          const r = await createPptx(title, text, list_items, filename);
-          createdFiles.push({
-            filename: r.stored.filename,
-            downloadUrl: `/api/download/${r.stored.id}`,
-            message: r.message,
-          });
-          return r.message;
-        },
-        create_xlsx: async (table_csv: string, filename: string) => {
-          const r = await createXlsx(table_csv, filename);
-          createdFiles.push({
-            filename: r.stored.filename,
-            downloadUrl: `/api/download/${r.stored.id}`,
-            message: r.message,
-          });
-          return r.message;
-        },
-        create_pdf: async (
-          title: string,
-          text: string,
-          list_items: string,
-          filename: string
-        ) => {
-          const r = await createPdf(title, text, list_items, filename);
-          createdFiles.push({
-            filename: r.stored.filename,
-            downloadUrl: `/api/download/${r.stored.id}`,
-            message: r.message,
-          });
-          return r.message;
-        },
-        create_txt: async (
-          title: string,
-          text: string,
-          list_items: string,
-          table_csv: string,
-          filename: string
-        ) => {
-          const r = await createTxt(title, text, list_items, table_csv, filename);
-          createdFiles.push({
-            filename: r.stored.filename,
-            downloadUrl: `/api/download/${r.stored.id}`,
-            message: r.message,
-          });
-          return r.message;
-        },
-        create_md: async (
-          title: string,
-          text: string,
-          list_items: string,
-          table_csv: string,
-          filename: string
-        ) => {
-          const r = await createMd(title, text, list_items, table_csv, filename);
-          createdFiles.push({
-            filename: r.stored.filename,
-            downloadUrl: `/api/download/${r.stored.id}`,
-            message: r.message,
-          });
-          return r.message;
-        },
-        create_html: async (
-          title: string,
-          text: string,
-          list_items: string,
-          table_csv: string,
-          filename: string
-        ) => {
-          const r = await createHtml(title, text, list_items, table_csv, filename);
-          createdFiles.push({
-            filename: r.stored.filename,
-            downloadUrl: `/api/download/${r.stored.id}`,
-            message: r.message,
-          });
-          return r.message;
-        },
-        create_from_text: async (
-          raw_text: string,
-          format: string = 'docx',
-          filename: string = 'document'
-        ) => {
-          const layout = parseLayoutFromText(String(raw_text ?? ''));
-          const r = await generateByFormat(format, layout, filename);
-          createdFiles.push({
-            filename: r.stored.filename,
-            downloadUrl: `/api/download/${r.stored.id}`,
-            message: r.message,
-          });
-          return r.message;
-        },
-        parse_layout: (raw_text: string) => {
-          return parseLayoutFromText(String(raw_text ?? ''));
-        },
-        save_file_to_download: async (
-          filename: string,
-          content: string | Buffer | Uint8Array
-        ) => {
-          const buf = Buffer.isBuffer(content)
-            ? content
-            : content instanceof Uint8Array
-            ? Buffer.from(content)
-            : Buffer.from(String(content), 'utf-8');
-          const stored = storeGeneratedFile(filename, 'application/octet-stream', buf);
-          const msg = `Файл ${stored.filename} сохранен в Downloads`;
-          createdFiles.push({
-            filename: stored.filename,
-            downloadUrl: `/api/download/${stored.id}`,
-            message: msg,
-          });
-          return `/Downloads/${stored.filename}`;
-        },
-        print: (...args: unknown[]) => {
-          appendLog(`[PRINT] ${args.map((a) => String(a)).join(' ')}`);
-        },
-      });
-
-      const transformed = preprocessScript(code);
-      const wrapped = `(async () => {\n${transformed}\n})()`;
-      const execution = vm.runInContext(wrapped, context, { timeout: 5000 });
-      await execution;
-
-      for (const file of createdFiles) {
-        appendLog(file.message);
-      }
-      appendLog('✅ Скрипт выполнен успешно.');
-
-      res.json({ ok: true, logs, createdFiles });
-    } catch (err) {
-      const errorText = err instanceof Error ? `${err.message}\n${err.stack ?? ''}` : String(err);
-      appendLog(`❌ Ошибка: ${errorText}`);
-      res.status(200).json({ ok: false, logs, createdFiles });
-    }
+    const result = await executeScriptUnified(code);
+    res.status(200).json(result);
   });
 
   app.get('/api/download/:id', (req, res) => {
